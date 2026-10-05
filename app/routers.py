@@ -45,6 +45,8 @@ from .schemas import (
     DeliveryReceiptRequest,
     DeliveryReceiptResponse,
     ReferenceIssueRequest,
+    ReviewDecisionRequest,
+    ReviewRequestSubmit,
     RevokeRequest,
 )
 
@@ -336,3 +338,63 @@ def get_revocation_archive_impact(
     （含级联失效）的归档包及包内目标证书，按 (归档包编号, 原交付序位) 分页。"""
     with pool.connection() as conn:
         return repo.get_revocation_archive_impact(conn, batch_id, limit, offset)
+
+
+# ---------------------------------------------------------------------------
+# 双人复核：录入申请（X-Submitter-Key）与复核定稿（X-Reviewer-Key）
+# ---------------------------------------------------------------------------
+
+@router.post("/review-requests", status_code=201)
+def submit_review_request(
+    req: ReviewRequestSubmit,
+    response: Response,
+    x_submitter_key: str | None = Header(
+        default=None,
+        alias="X-Submitter-Key",
+        description="录入人本地配置的身份凭据",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """录入人提交双人复核申请：申请号 + 完整签发资料，仅保存待审内容，
+    不占用证书编号与设备有效期（批准时才真正签发）。
+
+    同号同内容重试返回原申请（200）；同号异内容 409 review_request_conflict。
+    """
+    with pool.connection() as conn:
+        body, created = repo.submit_review_request(conn, req, x_submitter_key)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.post("/review-requests/{request_no}/review", status_code=201)
+def decide_review_request(
+    request_no: str,
+    req: ReviewDecisionRequest,
+    response: Response,
+    x_reviewer_key: str | None = Header(
+        default=None,
+        alias="X-Reviewer-Key",
+        description="复核人本地配置的身份凭据（与录入人凭据独立）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """复核人提交复核结论：APPROVE 在同一事务中按批准当时的规则真正签发并
+    绑定复核人；REJECT 附原因驳回。批准校验失败返回具体原因，申请仍待审
+    且不产生证书；驳回后不能再批准。
+
+    每份申请只允许一份定稿：同一复核操作的重试返回首次结果（200）；
+    不同操作再提交 409 review_conflict。
+    """
+    with pool.connection() as conn:
+        body, created = repo.decide_review_request(conn, request_no, req, x_reviewer_key)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.get("/review-requests/{request_no}")
+def get_review_request(request_no: str, pool: ConnectionPool = Depends(pool_dep)):
+    """按申请号查询复核申请的状态与结果（待审签发资料、定稿结论与复核人绑定）。"""
+    with pool.connection() as conn:
+        return repo.get_review_request(conn, request_no)

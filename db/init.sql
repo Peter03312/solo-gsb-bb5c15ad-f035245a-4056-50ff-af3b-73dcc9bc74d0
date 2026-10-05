@@ -210,6 +210,48 @@ CREATE UNIQUE INDEX idx_cert_suspensions_one_active
     ON cert_suspensions(cert_no) WHERE (lifted_at IS NULL);
 
 -- ----------------------------------------------------------------------------
+-- 双人复核申请表：需双人复核的普通校准证书由录入人凭本地配置的身份凭据提交
+-- 申请号与完整签发资料；申请仅保存待审内容（request 快照），不写入
+-- certificates——不占用证书编号，也不占用设备有效期（排他约束不涉及）。
+-- request_no 为幂等键：同号同内容重试返回原申请，同号异内容按 request_hash
+-- 判冲突。复核人凭独立凭据定稿：驳回（REJECT，须非空原因）或批准（APPROVE，
+-- 在同一事务中按批准当时的规则真正签发证书并绑定复核人）。每份申请至多一次
+-- 定稿（PENDING -> APPROVED/REJECTED 单次迁移由触发器强制），review_hash 为
+-- 定稿内容指纹：同操作重试返回首次结果，异操作判冲突。本表只增不改（除该
+-- 一次性定稿迁移外），批准校验失败时申请保持 PENDING 且不产生证书。
+-- ----------------------------------------------------------------------------
+CREATE TABLE review_requests (
+    request_no     TEXT PRIMARY KEY,                -- 申请号（幂等键，业务唯一）
+    request_hash   TEXT NOT NULL,                   -- 规范化申请内容的 SHA-256 指纹
+    request        JSONB NOT NULL,                  -- 待审签发资料快照（完整提交内容）
+    cert_no        TEXT NOT NULL,                   -- 拟签发证书编号（不占用，仅冗余展示/索引）
+    submitter      TEXT,                            -- 录入人标识（可选）
+    status         TEXT NOT NULL DEFAULT 'PENDING'
+                   CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED')),
+    reviewer       TEXT,                            -- 复核人标识（定稿时写入，与证书绑定）
+    decision       TEXT CHECK (decision IN ('APPROVE', 'REJECT')),
+    reason         TEXT,                            -- 驳回原因（REJECT 时非空）
+    review_hash    TEXT,                            -- 定稿内容指纹（同操作重试判定）
+    reviewed_at    TIMESTAMPTZ,                     -- 定稿时刻（批准时与证书同事务写入）
+    issued_cert_no TEXT REFERENCES certificates(cert_no), -- 批准签发的证书（绑定点）
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT review_request_final_metadata
+        CHECK (
+            (status = 'PENDING' AND decision IS NULL AND reviewer IS NULL
+             AND reason IS NULL AND review_hash IS NULL AND reviewed_at IS NULL
+             AND issued_cert_no IS NULL)
+            OR (status = 'APPROVED' AND decision = 'APPROVE' AND reviewer IS NOT NULL
+                AND review_hash IS NOT NULL AND reviewed_at IS NOT NULL
+                AND issued_cert_no IS NOT NULL)
+            OR (status = 'REJECTED' AND decision = 'REJECT' AND reviewer IS NOT NULL
+                AND review_hash IS NOT NULL AND reviewed_at IS NOT NULL
+                AND reason IS NOT NULL)
+        )
+);
+CREATE INDEX idx_review_requests_cert   ON review_requests(cert_no);
+CREATE INDEX idx_review_requests_status ON review_requests(status);
+
+-- ----------------------------------------------------------------------------
 -- 触发器 1：证书签发内容不可改写
 -- 仅允许 status / revoked_reason / revoked_at 在撤销事务中变化；
 -- 其余业务字段（编号、设备、时间、结论、引用关系等）一律拒绝 UPDATE。
@@ -332,6 +374,36 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_cert_suspensions_lift_only
     BEFORE UPDATE OR DELETE ON cert_suspensions
     FOR EACH ROW EXECUTE FUNCTION cert_suspensions_lift_only();
+
+-- 复核申请仅允许“定稿”这一次性 UPDATE：从待审（PENDING）迁移到
+-- APPROVED/REJECTED，提交内容列（申请号、指纹、签发资料快照、拟签发编号、
+-- 录入人、提交时刻）一律不可改；已定稿记录不得再 UPDATE；DELETE 禁止。
+CREATE OR REPLACE FUNCTION review_requests_finalize_only() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'review_requests is append-only: %', OLD.request_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.status <> 'PENDING'
+       OR NEW.status = 'PENDING'
+       OR NEW.request_no   IS DISTINCT FROM OLD.request_no
+       OR NEW.request_hash IS DISTINCT FROM OLD.request_hash
+       OR NEW.request      IS DISTINCT FROM OLD.request
+       OR NEW.cert_no      IS DISTINCT FROM OLD.cert_no
+       OR NEW.submitter    IS DISTINCT FROM OLD.submitter
+       OR NEW.created_at   IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'review_requests rows can only be finalized once (request_no=%)',
+            OLD.request_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_review_requests_finalize_only
+    BEFORE UPDATE OR DELETE ON review_requests
+    FOR EACH ROW EXECUTE FUNCTION review_requests_finalize_only();
 
 -- ----------------------------------------------------------------------------
 -- 查询视图：统一将枚举以文本形式暴露给应用层

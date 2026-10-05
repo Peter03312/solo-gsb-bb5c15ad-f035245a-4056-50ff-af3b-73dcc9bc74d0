@@ -23,5 +23,11 @@ class Settings(BaseSettings):
     # 仅本地配置、不落库；生产部署必须通过环境变量覆盖默认值。
     delivery_management_key: str = "caltrace-delivery-admin"
 
+    # 双人复核身份凭据：录入人提交复核申请时凭 X-Submitter-Key 头校验，
+    # 复核人批准/驳回时凭 X-Reviewer-Key 头校验。两把钥匙相互独立（不同身份），
+    # 仅本地配置、不落库；生产部署必须覆盖为不同的随机长密钥。
+    review_submitter_key: str = "caltrace-review-submitter"
+    review_reviewer_key: str = "caltrace-review-reviewer"
+
 
 settings = Settings()

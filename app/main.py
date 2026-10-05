@@ -43,6 +43,10 @@ app = FastAPI(
         "复核后凭管理密钥解除停用，停用/解除与并发签发按提交次序生效；"
         "可查询当前停用状态与历次停用/解除的时间和原因，停用不改写证书内容、"
         "撤销状态与已冻结交付快照；"
+        "支持普通校准证书双人复核：录入人凭本地配置的录入人凭据提交申请号与完整"
+        "签发资料（仅保存待审内容，不占用证书编号与设备有效期），复核人凭独立"
+        "凭据批准（同一事务中按批准当时的规则真正签发并绑定复核人）或附原因驳回，"
+        "每份申请只允许一份定稿，可按申请号查询状态与结果；"
         "支持按撤销批次追查已交付归档凭据的影响面（冻结链命中本批被撤销证书的"
         "归档包与包内目标证书，分页输出）；"
         "支持按设备审计过去半开区间内的校准覆盖：按时间顺序返回完整、无重叠的"
@@ -105,6 +109,9 @@ def index():
             "POST /api/v1/delivery-invitations",
             "POST /api/v1/delivery-receipts",
             "GET  /api/v1/delivery-archives/{archive_no}/receipt",
+            "POST /api/v1/review-requests",
+            "POST /api/v1/review-requests/{request_no}/review",
+            "GET  /api/v1/review-requests/{request_no}",
             "GET  /api/v1/devices/{device_id}/certificates",
             "GET  /api/v1/devices/{device_id}/coverage-audit",
             "GET  /api/v1/revocations",

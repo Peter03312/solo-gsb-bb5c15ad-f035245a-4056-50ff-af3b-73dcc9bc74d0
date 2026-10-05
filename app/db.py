@@ -164,6 +164,67 @@ CREATE OR REPLACE TRIGGER trg_delivery_receipts_no_delete
     BEFORE DELETE ON delivery_receipts
     FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
 """,
+    """
+CREATE TABLE IF NOT EXISTS review_requests (
+    request_no     TEXT PRIMARY KEY,
+    request_hash   TEXT NOT NULL,
+    request        JSONB NOT NULL,
+    cert_no        TEXT NOT NULL,
+    submitter      TEXT,
+    status         TEXT NOT NULL DEFAULT 'PENDING'
+                   CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED')),
+    reviewer       TEXT,
+    decision       TEXT CHECK (decision IN ('APPROVE', 'REJECT')),
+    reason         TEXT,
+    review_hash    TEXT,
+    reviewed_at    TIMESTAMPTZ,
+    issued_cert_no TEXT REFERENCES certificates(cert_no),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT review_request_final_metadata
+        CHECK (
+            (status = 'PENDING' AND decision IS NULL AND reviewer IS NULL
+             AND reason IS NULL AND review_hash IS NULL AND reviewed_at IS NULL
+             AND issued_cert_no IS NULL)
+            OR (status = 'APPROVED' AND decision = 'APPROVE' AND reviewer IS NOT NULL
+                AND review_hash IS NOT NULL AND reviewed_at IS NOT NULL
+                AND issued_cert_no IS NOT NULL)
+            OR (status = 'REJECTED' AND decision = 'REJECT' AND reviewer IS NOT NULL
+                AND review_hash IS NOT NULL AND reviewed_at IS NOT NULL
+                AND reason IS NOT NULL)
+        )
+);
+CREATE INDEX IF NOT EXISTS idx_review_requests_cert   ON review_requests(cert_no);
+CREATE INDEX IF NOT EXISTS idx_review_requests_status ON review_requests(status);
+""",
+    """
+CREATE OR REPLACE FUNCTION review_requests_finalize_only() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'review_requests is append-only: %', OLD.request_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.status <> 'PENDING'
+       OR NEW.status = 'PENDING'
+       OR NEW.request_no   IS DISTINCT FROM OLD.request_no
+       OR NEW.request_hash IS DISTINCT FROM OLD.request_hash
+       OR NEW.request      IS DISTINCT FROM OLD.request
+       OR NEW.cert_no      IS DISTINCT FROM OLD.cert_no
+       OR NEW.submitter    IS DISTINCT FROM OLD.submitter
+       OR NEW.created_at   IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'review_requests rows can only be finalized once (request_no=%)',
+            OLD.request_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_review_requests_finalize_only
+    BEFORE UPDATE OR DELETE ON review_requests
+    FOR EACH ROW EXECUTE FUNCTION review_requests_finalize_only();
+""",
 )
 
 

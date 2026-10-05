@@ -18,6 +18,13 @@
 证书为追溯依据（单张与交接批次、批内引用均强制校验，命中整批不落库）；
 复核后凭管理密钥解除停用；可查询当前停用状态及历次停用/解除的时间与原因。
 停用不改写证书内容、撤销状态与已冻结的交付快照。
+需双人复核的普通校准证书可走**复核申请**流程：录入人凭本地配置的录入人
+凭据提交申请号与完整签发资料，申请仅保存待审内容，**不占用证书编号与设备
+有效期**；不同身份的复核人凭独立凭据**附原因驳回**，或**批准**——批准在
+同一事务中按批准当时的标准证书状态、临时停用及现有签发规则**真正签发**，
+并将结论、复核人与证书绑定。批准校验失败返回具体原因，申请仍待审且不产生
+证书；驳回后不能再批准。申请号同内容重试返回原申请、异内容冲突；每份申请
+只允许一份定稿，同操作重试返回首次结果；可按申请号查询状态与结果。
 面向监管与内审，还可按设备**审计过去半开区间内的校准覆盖**：按时间顺序还原
 完整、无重叠的合规与空窗片段，合规片段列出当时可用的合格普通证书编号。
 
@@ -39,7 +46,7 @@
 │   ├── db.py            # 连接池
 │   ├── config.py        # 环境变量配置
 │   └── errors.py        # 统一业务错误
-├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、批次/更正/交付归档/签收/停用表）
+├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、批次/更正/交付归档/签收/停用/复核申请表）
 ├── scripts/             # 冒烟测试脚本（可直接对运行中的服务执行）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -95,6 +102,8 @@ docker compose down -v       # 停止并删除数据卷（下次启动重新初�
 | `POSTGRES_PORT` | `127.0.0.1:5432` | 数据库在宿主机的绑定地址:端口 |
 | `DB_HOST` / `DB_PORT` | `db` / `5432` | API 容器内连接数据库用（compose 已固定） |
 | `DELIVERY_MANAGEMENT_KEY` | `caltrace-delivery-admin` | 管理密钥：创建签收邀请、查询定稿记录，以及标准证书临时停用的登记/解除/查询均经 `X-Management-Key` 头校验；默认值仅供本机开发，生产必须覆盖为随机长密钥 |
+| `REVIEW_SUBMITTER_KEY` | `caltrace-review-submitter` | 双人复核录入人凭据：提交复核申请经 `X-Submitter-Key` 头校验；默认值仅供本机开发，生产必须覆盖为随机长密钥 |
+| `REVIEW_REVIEWER_KEY` | `caltrace-review-reviewer` | 双人复核复核人凭据：批准/驳回经 `X-Reviewer-Key` 头校验，与录入人凭据相互独立（不同身份）；默认值仅供本机开发，生产必须覆盖为与录入人不同的随机长密钥 |
 
 ### 不用 Compose、直连已有 PostgreSQL
 
@@ -249,6 +258,36 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
       返回归档号、收件人、结论、拒收原因与签收时刻；密钥错误 `401`，
       归档包不存在 `404 archive_not_found`，归档包存在但尚未定稿
       `404 receipt_not_found`。
+15. **双人复核（录入申请 + 复核定稿）**：需双人复核的普通校准证书不直接签发，
+    走复核申请流程：
+    - **提交申请**：录入人在 `X-Submitter-Key` 头中携带本地配置的录入人凭据
+      （`REVIEW_SUBMITTER_KEY`），提交**申请号 + 完整签发资料**（与直接签发
+      同构）。申请仅保存待审内容快照：不写入 `certificates`，**不占用证书
+      编号与设备有效期**——同编号证书仍可直接签发、同设备重叠区间仍可由
+      其他证书占用，提交时不做签发业务校验。申请号为幂等键：同号同内容
+      重试返回原申请（HTTP 200），同号异内容返回
+      `409 review_request_conflict`；并发同号提交由主键兜底。
+    - **复核定稿**：不同身份的复核人在 `X-Reviewer-Key` 头中携带独立的
+      复核人凭据（`REVIEW_REVIEWER_KEY`），提交 `APPROVE`/`REJECT` 结论与
+      非空复核人标识；`REJECT` 必须附非空原因
+      （`422 review_reason_required`），`APPROVE` 忽略原因。**批准**
+      （APPROVE）在**同一事务**中按**批准当时**的标准证书状态、临时停用及
+      现有签发规则（引用存在/生效/合格/校准时刻在有效期内、引用链无停用、
+      不成环、同设备有效期不重叠）**真正签发**，并将结论、复核人与证书绑定
+      （定稿时刻与证书创建时刻为同一事务时刻）；校验失败返回与直接签发
+      一致的具体错误（如 `reference_suspended`、`validity_overlap`、
+      `cert_duplicate`），**申请仍待审且不产生证书**，条件具备后可再次批准。
+      **驳回**（REJECT）附原因定稿，**驳回后不能再批准**。
+    - **每份申请只允许一份定稿**（`PENDING → APPROVED/REJECTED` 单次迁移由
+      数据库触发器强制，申请行 `FOR UPDATE` 串行化并发复核）：同一复核操作
+      （同结论、同复核人、同原因）的重试返回首次定稿结果（HTTP 200）；
+      不同操作再提交（含驳回后批准、批准后复核、换复核人/换原因）一律
+      `409 review_conflict`，错误详情给出首次定稿信息。
+    - **查询**：`GET /api/v1/review-requests/{request_no}` 返回待审签发资料、
+      状态（`PENDING`/`APPROVED`/`REJECTED`）与定稿结果（结论、复核人、
+      原因、定稿时刻；批准时含签发证书当前内容与追溯链——证书事后被撤销
+      时状态如实展示）。申请记录只增不改（除该一次性定稿迁移），提交内容
+      快照不可改写；原有直接签发及证书查询契约保持不变。
 
 证书状态：`ACTIVE` 生效中 / `REVOKED` 被主动撤销 / `INVALID` 因上游撤销级联失效。
 
@@ -912,6 +951,130 @@ curl -sS http://localhost:8080/api/v1/certificates/REF-MASTER-001/suspensions \
 `ACTIVE/REVOKED/INVALID` 状态不变（撤销与停用互不改写，可并存），
 撤销批次与级联失效记录不变，已冻结交付归档快照与批次首次签发快照不变。
 
+### 22. 提交双人复核申请（录入人，录入人凭据）
+
+需双人复核的普通校准证书由录入人提交复核申请。录入人凭据通过
+`X-Submitter-Key` 请求头提交（对应服务端环境变量 `REVIEW_SUBMITTER_KEY`）。
+申请仅保存待审签发资料：**不占用证书编号与设备有效期**，提交时不做签发
+业务校验（批准时才按当时规则真正签发）：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/review-requests \
+  -H 'Content-Type: application/json' \
+  -H 'X-Submitter-Key: caltrace-review-submitter' \
+  -d '{
+    "request_no": "RR-2026-0001",
+    "submitter": "李录入",
+    "certificate": {
+      "cert_no": "CAL-WS-100",
+      "device_id": "DEV-WS-A",
+      "device_name": "车间万用表A",
+      "valid_from": "2026-03-01T00:00:00+08:00",
+      "valid_to":   "2027-03-01T00:00:00+08:00",
+      "calibrated_at": "2026-03-05T10:00:00+08:00",
+      "conclusion": "PASS",
+      "parent_cert_no": "REF-MASTER-001",
+      "operator": "李工"
+    }
+  }' | python3 -m json.tool
+```
+
+首次提交响应 `201`（`certificate` 字段与直接签发请求同构）：
+
+```json
+{
+  "request_no": "RR-2026-0001",
+  "status": "PENDING",
+  "submitter": "李录入",
+  "request": {"cert_no": "CAL-WS-100", "device_id": "DEV-WS-A", "conclusion": "PASS", ...},
+  "created_at": "2026-10-05T01:00:00.123456+00:00",
+  "review": null
+}
+```
+
+约定：
+
+- 录入人凭据头缺失或错误 → `401 invalid_submitter_key`；
+- **同号同内容重试** → `200`，返回原申请（`created_at` 不变，不重复登记）；
+- **同号异内容** → `409 review_request_conflict`；
+- 申请提交后证书并未签发：`GET /api/v1/certificates/CAL-WS-100` 仍为 404，
+  同编号/同设备重叠区间的直接签发或其他申请均不受阻。
+
+### 23. 复核人提交复核结论（批准签发 / 附因驳回）
+
+复核人凭据通过 `X-Reviewer-Key` 请求头提交（对应服务端环境变量
+`REVIEW_REVIEWER_KEY`，与录入人凭据相互独立）。批准（APPROVE）在**同一
+事务**中按批准当时的标准证书状态、临时停用及现有签发规则真正签发，并将
+结论、复核人与证书绑定：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/review-requests/RR-2026-0001/review \
+  -H 'Content-Type: application/json' \
+  -H 'X-Reviewer-Key: caltrace-review-reviewer' \
+  -d '{"decision": "APPROVE", "reviewer": "王复核"}' | python3 -m json.tool
+```
+
+批准成功响应 `201`（定稿时刻与证书创建时刻为同一事务时刻）：
+
+```json
+{
+  "request_no": "RR-2026-0001",
+  "status": "APPROVED",
+  "submitter": "李录入",
+  "request": {"cert_no": "CAL-WS-100", ...},
+  "created_at": "2026-10-05T01:00:00.123456+00:00",
+  "review": {
+    "decision": "APPROVE",
+    "reviewer": "王复核",
+    "reason": null,
+    "reviewed_at": "2026-10-05T02:00:00.123456+00:00",
+    "cert_no": "CAL-WS-100",
+    "certificate": {"cert_no": "CAL-WS-100", "status": "ACTIVE", ...},
+    "chain": {"cert_no": "CAL-WS-100", "root_cert_no": "REF-MASTER-001", "length": 2, "nodes": [...]}
+  }
+}
+```
+
+驳回（REJECT）必须附非空原因：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/review-requests/RR-2026-0002/review \
+  -H 'Content-Type: application/json' \
+  -H 'X-Reviewer-Key: caltrace-review-reviewer' \
+  -d '{"decision": "REJECT", "reviewer": "王复核", "reason": "签发资料不全，退回补正"}'
+```
+
+定稿与重试约定（**每份申请只允许一份定稿**）：
+
+- **同一复核操作**（同结论、同复核人、同原因）的重试 → `200`，原样返回
+  首次定稿结果（`reviewed_at` 不变，批准不会重复签发）；
+- **不同操作再提交**（驳回后批准、批准后再复核、换复核人/换原因）→
+  `409 review_conflict`，`details.finalized_status` / `finalized_decision` /
+  `finalized_reviewer` 给出首次定稿信息；
+- 复核人凭据缺失/错误 → `401 invalid_reviewer_key`；申请号未知 →
+  `404 review_request_not_found`；复核人标识空白 → `422 reviewer_required`；
+  REJECT 缺原因 → `422 review_reason_required`；
+- **批准校验失败**（如引用链临时停用、设备有效期被占用、证书编号已存在、
+  引用不存在/已撤销）→ 返回与直接签发一致的具体错误
+  （`422 reference_suspended` / `422 validity_overlap` / `409 cert_duplicate` /
+  `422 invalid_reference` / `422 reference_not_active` 等），**申请仍待审
+  （PENDING）且不产生证书**，条件具备后可再次批准或驳回收尾；
+- 并发复核同一申请：行锁串行化，恰好一份定稿（1×`201`），同操作重试
+  `200`、异操作 `409`；与并发停用/撤销竞争的等待环由死锁检测终止并重试，
+  耗尽 → `409 review_busy`（调用方可重试）。
+
+### 24. 按申请号查询复核状态与结果
+
+```bash
+curl -sS http://localhost:8080/api/v1/review-requests/RR-2026-0001 | python3 -m json.tool
+```
+
+返回与提交/复核响应同构的申请视图：`status`（`PENDING`/`APPROVED`/
+`REJECTED`）、待审签发资料快照 `request`、提交时刻，以及定稿结果 `review`
+（待审时为 `null`；批准时含签发证书的**当前内容**与追溯链——证书事后被
+撤销/失效时状态如实展示，与证书查询契约一致）。申请号未知 →
+`404 review_request_not_found`。查询无需凭据。
+
 ---
 
 ## 错误响应
@@ -920,9 +1083,16 @@ curl -sS http://localhost:8080/api/v1/certificates/REF-MASTER-001/suspensions \
 
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
-| 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` / `declaration_not_found` / `archive_not_found` / `invitation_not_found` / `receipt_not_found` | 目标不存在（`receipt_not_found`：归档包存在但尚未定稿） |
+| 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` / `declaration_not_found` / `archive_not_found` / `invitation_not_found` / `receipt_not_found` / `review_request_not_found` | 目标不存在（`receipt_not_found`：归档包存在但尚未定稿） |
 | 401 | `invalid_management_key` | 创建签收邀请、查询定稿记录，或登记/解除/查询标准证书停用时 `X-Management-Key` 缺失/错误 |
 | 401 | `invalid_receipt_key` | 提交签收时一次性密钥错误 |
+| 401 | `invalid_submitter_key` | 提交双人复核申请时 `X-Submitter-Key` 录入人凭据缺失/错误 |
+| 401 | `invalid_reviewer_key` | 提交复核结论（批准/驳回）时 `X-Reviewer-Key` 复核人凭据缺失/错误 |
+| 409 | `review_request_conflict` | 同一申请号提交了内容不同的复核申请 |
+| 409 | `review_conflict` | 申请已定稿：驳回后批准、批准后再复核、换复核人/换原因等异操作再提交（同操作重试返回首次结果） |
+| 409 | `review_busy` | 复核批准与并发停用/撤销竞争且死锁重试耗尽（防御性兜底，调用方可重试） |
+| 422 | `reviewer_required` | 复核人标识为空或纯空白 |
+| 422 | `review_reason_required` | REJECT 未填写或仅空白的驳回原因 |
 | 409 | `suspension_conflict` | 证书已存在生效中的临时停用记录，重复停用被拒 |
 | 409 | `suspension_not_active` | 证书没有生效中的临时停用记录（重复/并发解除） |
 | 409 | `cert_not_active` | 撤销一张非 ACTIVE 证书，或对非生效（含已撤销/失效）证书登记停用 |
@@ -976,6 +1146,7 @@ python3 scripts/impact_checks.py      # 撤销影响面：命中判定/序位/�
 python3 scripts/receipt_checks.py     # 交付签收：邀请一次性密钥/截止/定稿幂等冲突/撤销拦截/并发次序
 python3 scripts/coverage_checks.py    # 覆盖审计：计入窗口/撤销与级联截断/重签还原/空窗/参数错误
 python3 scripts/suspension_checks.py  # 标准证书临时停用：登记/解除/查询/受阻链单张与批次拦截/不改写/提交次序并发
+python3 scripts/review_checks.py      # 双人复核：申请幂等/不占用编号与有效期/批准签发绑定/驳回/校验失败仍待审/并发唯一定稿
 ```
 
 覆盖：基准登记、多级签发、无效引用、越界校准时刻、区间重叠（含首尾相接）、
@@ -1030,4 +1201,14 @@ ACCEPT 且不被随后撤销改写，先撤销则 ACCEPT 422 且不留定稿）�
 已冻结交付快照、定稿记录、更正视图；停用期间交付归档/更正/ACCEPT 不受
 影响，撤销与停用可并存且互不改写；停用/解除×签发的 32 路提交次序并发
 （先停用则后到签发必拒、先签发则落库；先解除则放行、签发先到则 422），
-以及既有签发/撤销/批次/归档/签收接口契约与根索引端点清单不变。
+以及既有签发/撤销/批次/归档/签收接口契约与根索引端点清单不变；
+双人复核的录入人/复核人凭据校验（401）、申请提交（201/同号同内容 200/
+同号异内容 409）、申请不占用证书编号与设备有效期（同编号与同设备重叠
+区间仍可直接签发）、复核前置校验（未知申请号 404/复核人空白 422/驳回
+缺原因 422）、驳回定稿与驳回后不能批准（409）、批准同事务真正签发并
+绑定复核人（定稿时刻=证书创建时刻）、同操作重试返回首次定稿（200）、
+批准时校验失败返回具体原因且申请仍待审不产生证书（停用链/有效期重叠/
+编号冲突/引用不存在/引用已撤销，解除停用后批准成功）、并发复核唯一定稿
+（10 路同内容批准 1×201+9×200 响应一致、12 路批准×驳回混合恰好一份
+定稿、8 路并发同号提交同内容 1×201 异内容仅 1 次成功），以及既有直接
+签发与证书查询契约不变。

@@ -35,6 +35,10 @@ services:
       DB_PASSWORD: ${POSTGRES_PASSWORD:-caltrace}
       # 交付方管理密钥：默认值仅供本机开发，生产请在 .env/环境中覆盖
       DELIVERY_MANAGEMENT_KEY: ${DELIVERY_MANAGEMENT_KEY:-caltrace-delivery-admin}
+      # 双人复核身份凭据：录入人（X-Submitter-Key）与复核人（X-Reviewer-Key）
+      # 相互独立；默认值仅供本机开发，生产请覆盖为不同的随机长密钥
+      REVIEW_SUBMITTER_KEY: ${REVIEW_SUBMITTER_KEY:-caltrace-review-submitter}
+      REVIEW_REVIEWER_KEY: ${REVIEW_REVIEWER_KEY:-caltrace-review-reviewer}
       APP_PORT: 8080
     ports:
       - "${APP_PORT:-8080}:8080"
