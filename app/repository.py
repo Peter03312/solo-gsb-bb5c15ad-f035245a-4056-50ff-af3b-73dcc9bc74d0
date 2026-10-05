@@ -11,6 +11,7 @@ from psycopg.types.json import Jsonb
 
 from .config import settings
 from .errors import ApiError
+from .schemas import CertificateIssueRequest
 
 # v_certificates 视图的列顺序
 _VIEW_COLS = (
@@ -334,15 +335,20 @@ def _insert_certificate(conn, *, kind: str, conclusion: str, parent_no: str | No
     return get_certificate(conn, req.cert_no)
 
 
-def _issue_certificate_once(conn, req) -> dict:
-    with conn.transaction():
-        _validate_parent(conn, req.parent_cert_no, req.calibrated_at, req.cert_no)
-        _assert_no_cycle(conn, req.parent_cert_no, req.cert_no)
-        _assert_no_overlap(conn, req.device_id, req.valid_from, req.valid_to, req.cert_no)
-        cert = _insert_certificate(
-            conn, kind="CALIBRATION", conclusion=req.conclusion,
-            parent_no=req.parent_cert_no, req=req,
-        )
+def _issue_certificate_in_tx(conn, req) -> dict:
+    """在调用方事务内完成普通证书的全部签发校验与落库，并返回证书与追溯链。
+
+    供单张直接签发（外层包一层事务）与复核申请批准（批准与申请状态推进、
+    结果绑定必须在同一事务内：签发任一步失败则整事务回滚，申请仍为待审、
+    不产生证书）共用。
+    """
+    _validate_parent(conn, req.parent_cert_no, req.calibrated_at, req.cert_no)
+    _assert_no_cycle(conn, req.parent_cert_no, req.cert_no)
+    _assert_no_overlap(conn, req.device_id, req.valid_from, req.valid_to, req.cert_no)
+    cert = _insert_certificate(
+        conn, kind="CALIBRATION", conclusion=req.conclusion,
+        parent_no=req.parent_cert_no, req=req,
+    )
     return {"certificate": cert, "chain": get_chain(conn, req.cert_no)}
 
 
@@ -354,13 +360,16 @@ def issue_certificate(conn, req) -> dict:
     按已提交的停用状态判定），耗尽则 409 issuance_busy（调用方可重试）。
     """
     try:
-        return _issue_certificate_once(conn, req)
+        with conn.transaction():
+            return _issue_certificate_in_tx(conn, req)
     except psycopg.errors.DeadlockDetected:
         try:
-            return _issue_certificate_once(conn, req)
+            with conn.transaction():
+                return _issue_certificate_in_tx(conn, req)
         except psycopg.errors.DeadlockDetected:
             try:
-                return _issue_certificate_once(conn, req)
+                with conn.transaction():
+                    return _issue_certificate_in_tx(conn, req)
             except psycopg.errors.DeadlockDetected:
                 raise ApiError(
                     409,
@@ -2167,3 +2176,294 @@ def get_device_coverage_audit(conn, device_id: str, qfrom: datetime, qto: dateti
             segments.append({"from": a, "to": b, "status": status, "cert_nos": active})
 
     return {"device_id": device_id, "from": start, "to": end, "segments": segments}
+
+
+# ---------------------------------------------------------------------------
+# 普通证书双人复核签发：录入人提交待审申请（不占编号/有效期），另一身份的
+# 复核人驳回（附原因）或批准——批准与真正签发在同一事务内按“批准当时”的
+# 标准证书状态、临时停用与现有签发规则完成，结论、复核人与证书绑定。
+# ---------------------------------------------------------------------------
+
+_REVIEW_COLS = (
+    "application_no, request_hash, request, status, submitter, submitter_key_hash, "
+    "submitted_at, reviewer, decision_reason, reviewed_at, cert_no, result"
+)
+
+
+def _identify(provided: str | None, identities: dict[str, str], *, role: str) -> tuple[str, str]:
+    """按本地身份凭据表认证，返回 (身份名, 凭据 SHA-256)。
+
+    凭据仅本地配置、不落库；库内只持久化 SHA-256 指纹（用于双人不同凭据
+    校验），响应只回显身份名。恒定时间比较，避免计时侧信道。
+    """
+    if not provided:
+        raise ApiError(
+            401,
+            "invalid_identity_key",
+            f"缺少{role}凭据：须在请求头中携带本地配置的{role}身份凭据",
+        )
+    for name, secret in identities.items():
+        if hmac.compare_digest(provided, secret):
+            return name, hashlib.sha256(provided.encode("utf-8")).hexdigest()
+    raise ApiError(
+        401,
+        "invalid_identity_key",
+        f"{role}身份凭据无效：凭据不在本地配置的{role}凭据表中",
+    )
+
+
+def _get_review_row(conn, application_no: str, lock: bool = False) -> dict | None:
+    sql = f"SELECT {_REVIEW_COLS} FROM certificate_review_requests WHERE application_no = %s"
+    if lock:
+        sql += " FOR UPDATE"
+    return conn.execute(sql, (application_no,)).fetchone()
+
+
+def _review_view(row: dict) -> dict:
+    """复核申请行 -> API 视图；批准结果从 result 快照还原（不依赖证书当前状态）。"""
+    review = None
+    if row["status"] in ("APPROVED", "REJECTED"):
+        review = {
+            "decision": "APPROVE" if row["status"] == "APPROVED" else "REJECT",
+            "reviewer": row["reviewer"],
+            "reason": row["decision_reason"],
+            "reviewed_at": row["reviewed_at"],
+        }
+    body = {
+        "application_no": row["application_no"],
+        "status": row["status"],
+        "request": row["request"],
+        "submitter": row["submitter"],
+        "submitted_at": row["submitted_at"],
+        "review": review,
+        "certificate": None,
+        "chain": None,
+    }
+    if row["status"] == "APPROVED" and row["result"] is not None:
+        body["certificate"] = row["result"]["certificate"]
+        body["chain"] = row["result"]["chain"]
+    return body
+
+
+def submit_certificate_review(conn, req, entry_key: str | None) -> tuple[dict, bool]:
+    """录入人提交普通证书签发复核申请，返回 (申请视图, 是否首次提交)。
+
+    - 录入凭据经 X-Entry-Key 校验（401 invalid_identity_key）；
+    - 申请只保存待审内容：不预占证书编号（cert_duplicate 等在批准时才判定）、
+      不预占设备有效期（validity_overlap 在批准时才判定），因此引用尚不存在、
+      区间当下重叠等都允许先提交，能否签发以“批准当时”的状态为准；
+    - 申请号幂等：同号同内容重试返回原申请（200，状态随原申请），
+      同号异内容返回 409 review_request_conflict；并发同号由主键兜底。
+    """
+    submitter, _ = _identify(entry_key, settings.entry_identities, role="录入人")
+    req_hash, request_doc = _canonical_request(req)
+    try:
+        with conn.transaction():
+            existing = _get_review_row(conn, req.application_no)
+            if existing is not None:
+                if existing["request_hash"] != req_hash:
+                    raise ApiError(
+                        409,
+                        "review_request_conflict",
+                        f"申请号 {req.application_no} 已用于一份签发资料不同的复核申请；"
+                        "同一申请号只允许重放完全相同的请求",
+                        details={"application_no": req.application_no},
+                    )
+                return _review_view(existing), False
+            conn.execute(
+                """
+                INSERT INTO certificate_review_requests
+                    (application_no, request_hash, request, status,
+                     submitter, submitter_key_hash)
+                VALUES (%s, %s, %s, 'PENDING', %s, %s)
+                """,
+                (
+                    req.application_no,
+                    req_hash,
+                    Jsonb(request_doc),
+                    submitter,
+                    hashlib.sha256((entry_key or "").encode("utf-8")).hexdigest(),
+                ),
+            )
+            row = _get_review_row(conn, req.application_no)
+        return _review_view(row), True
+    except psycopg.errors.UniqueViolation:
+        # 并发同号提交：主键兜底，后到事务回滚后按已提交申请重放/判冲突
+        existing = _get_review_row(conn, req.application_no)
+        if existing is None:
+            raise
+        if existing["request_hash"] != req_hash:
+            raise ApiError(
+                409,
+                "review_request_conflict",
+                f"申请号 {req.application_no} 已用于一份签发资料不同的复核申请（并发提交）",
+                details={"application_no": req.application_no},
+            )
+        return _review_view(existing), False
+
+
+def _decision_request_hash(decision: str, reason: str | None) -> str:
+    """规范化复核操作指纹：结论与驳回原因参与判定；复核人身份另行强校验。"""
+    canonical = json.dumps(
+        {"decision": decision, "reason": reason},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _decided_conflict(existing: dict) -> ApiError:
+    """已定稿申请的再次定稿一律冲突（驳回后不能再批准，批准后不能改判）。"""
+    return ApiError(
+        409,
+        "review_already_decided",
+        f"申请 {existing['application_no']} 已由复核人 {existing['reviewer']} "
+        f"{'批准' if existing['status'] == 'APPROVED' else '驳回'}："
+        "每份申请只允许一份定稿，驳回后不能再批准、批准后不能改判；"
+        "同复核人同操作重试才返回首次结果。",
+        details={
+            "application_no": existing["application_no"],
+            "status": existing["status"],
+            "finalized_reviewer": existing["reviewer"],
+            "finalized_decision": "APPROVE" if existing["status"] == "APPROVED" else "REJECT",
+        },
+    )
+
+
+def _decide_review_once(conn, application_no: str, req, reviewer: str, reviewer_key_hash: str, now: datetime):
+    """单次定稿事务；返回 (申请视图, 是否首次定稿)。
+
+    批准路径：先锁申请行（串行化并发定稿），再在同一事务内执行与直接签发
+    完全相同的校验与落库（_issue_certificate_in_tx），最后把申请推进为
+    APPROVED 并绑定证书与结果快照——任一步失败整事务回滚：申请仍 PENDING、
+    无证书产生，错误码/原因与直接签发一致。
+    """
+    with conn.transaction():
+        row = _get_review_row(conn, application_no, lock=True)
+        if row is None:
+            raise ApiError(
+                404, "review_request_not_found",
+                f"复核申请不存在: {application_no}",
+            )
+        if row["status"] != "PENDING":
+            # 同复核人 + 同操作（结论、原因一致）的重放返回首次结果；其余冲突。
+            same_decision = (
+                row["reviewer"] == reviewer
+                and (
+                    (row["status"] == "APPROVED" and req.decision == "APPROVE"
+                     and not req.reason)
+                    or (row["status"] == "REJECTED" and req.decision == "REJECT"
+                        and req.reason is not None
+                        and row["decision_reason"] == req.reason.strip())
+                )
+            )
+            if same_decision:
+                return _review_view(row), False
+            raise _decided_conflict(row)
+
+        # 双人复核：复核凭据不得与录入凭据为同一把
+        if hmac.compare_digest(row["submitter_key_hash"], reviewer_key_hash):
+            raise ApiError(
+                403,
+                "reviewer_must_differ",
+                "复核人不得与录入人使用同一把身份凭据：普通证书签发须经双人复核",
+                details={"application_no": application_no, "submitter": row["submitter"]},
+            )
+
+        reason = None
+        if req.decision == "REJECT":
+            if not req.reason or not req.reason.strip():
+                raise ApiError(
+                    422, "review_reason_required",
+                    "驳回(REJECT)必须填写非空驳回原因；批准(APPROVE)请使用 decision=APPROVE",
+                )
+            reason = req.reason.strip()
+            conn.execute(
+                """
+                UPDATE certificate_review_requests
+                SET status = 'REJECTED', reviewer = %s, decision_reason = %s, reviewed_at = %s
+                WHERE application_no = %s
+                """,
+                (reviewer, reason, now, application_no),
+            )
+        else:
+            if req.reason:
+                raise ApiError(
+                    422, "review_approve_reason_not_allowed",
+                    "批准(APPROVE)不得填写驳回原因；驳回请使用 decision=REJECT 并填写原因",
+                )
+            # 批准当时按现有规则真正签发（状态/停用/有效期/编号占用均在此刻校验）。
+            issue_req = CertificateIssueRequest.model_validate(row["request"])
+            result = _issue_certificate_in_tx(conn, issue_req)
+            conn.execute(
+                """
+                UPDATE certificate_review_requests
+                SET status = 'APPROVED', reviewer = %s, reviewed_at = %s,
+                    cert_no = %s, result = %s
+                WHERE application_no = %s
+                """,
+                (
+                    reviewer, now, issue_req.cert_no,
+                    Jsonb(result, dumps=_json_dumps), application_no,
+                ),
+            )
+        row = _get_review_row(conn, application_no)
+        return _review_view(row), True
+
+
+def decide_certificate_review(conn, application_no: str, req, reviewer_key: str | None) -> tuple[dict, bool]:
+    """复核人驳回/批准复核申请，返回 (申请视图, 是否首次定稿)。
+
+    - 复核凭据经 X-Reviewer-Key 校验（401 invalid_identity_key），且不得与
+      录入凭据相同（403 reviewer_must_differ）；
+    - 申请不存在 404 review_request_not_found；REJECT 原因空白 422
+      review_reason_required；APPROVE 带原因 422 review_approve_reason_not_allowed；
+    - 批准与真正签发同事务：签发校验失败时错误码与直接签发完全一致
+      （invalid_reference / reference_not_active / reference_suspended /
+      reference_not_qualified / reference_out_of_validity / validity_overlap /
+      cert_duplicate / validity_overlap_concurrent …），申请仍 PENDING、不产生证书；
+    - 驳回后不能再批准、批准后不能改判：仅同复核人同操作（同结论同原因）
+      重试返回首次结果（200），其余再定稿 409 review_already_decided；
+    - 并发定稿由申请行 FOR UPDATE 串行化，只有一份定稿；与停用/撤销的链上
+      等待环由死锁检测终止后整体重试，耗尽 409 review_busy。
+    """
+    reviewer, key_hash = _identify(reviewer_key, settings.reviewer_identities, role="复核人")
+    if req.decision == "REJECT" and req.reason is not None:
+        # 规范化原因（去首尾空白）参与同操作重放判定与落库
+        req = req.model_copy(update={"reason": req.reason.strip()})
+    for attempt in range(3):
+        try:
+            return _decide_review_once(
+                conn, application_no, req, reviewer, key_hash, datetime.now(timezone.utc)
+            )
+        except psycopg.errors.DeadlockDetected:
+            if attempt == 2:
+                raise ApiError(
+                    409,
+                    "review_busy",
+                    f"申请 {application_no} 的复核与并发停用/撤销竞争，重试后仍冲突，"
+                    "申请仍为待审，请稍后重试",
+                    details={"application_no": application_no},
+                )
+    raise ApiError(409, "review_busy", "复核定稿失败，请稍后重试")
+
+
+def get_certificate_review(conn, application_no: str, provided_key: str | None) -> dict:
+    """按申请号查询状态与结果；录入人或复核人凭据均可查询（仅本服务内部角色）。
+
+    凭据缺失/错误 401 invalid_identity_key；申请不存在 404 review_request_not_found。
+    PENDING 返回待审内容与提交信息；APPROVED 额外返回签发证书与追溯链
+    （首次签发结果快照）；REJECTED 返回驳回原因与复核人。
+    """
+    try:
+        _identify(provided_key, settings.entry_identities, role="录入人")
+    except ApiError as entry_err:
+        try:
+            _identify(provided_key, settings.reviewer_identities, role="复核人")
+        except ApiError:
+            raise entry_err
+    row = _get_review_row(conn, application_no)
+    if row is None:
+        raise ApiError(
+            404, "review_request_not_found", f"复核申请不存在: {application_no}"
+        )
+    return _review_view(row)

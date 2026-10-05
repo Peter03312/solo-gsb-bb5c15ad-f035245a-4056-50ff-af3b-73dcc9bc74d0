@@ -210,6 +210,50 @@ CREATE UNIQUE INDEX idx_cert_suspensions_one_active
     ON cert_suspensions(cert_no) WHERE (lifted_at IS NULL);
 
 -- ----------------------------------------------------------------------------
+-- 普通证书签发复核申请表：需双人复核的普通校准证书，录入人先提交申请（保存
+-- 待审内容与完整签发资料，不占用证书编号、不占用设备有效期），复核人再
+-- 附原因驳回，或批准——批准与真正签发在同一事务内按批准当时的标准证书状态、
+-- 临时停用与既有签发规则完成，结论、复核人与证书绑定。
+-- application_no 为业务幂等键：同号同内容重放返回原申请，同号异内容判冲突。
+-- status 只允许 PENDING -> APPROVED/REJECTED 一次性推进（触发器强制），
+-- 驳回后不能再批准。本表只增不改（状态推进以外的 UPDATE/DELETE 一律拒绝）。
+-- ----------------------------------------------------------------------------
+CREATE TABLE certificate_review_requests (
+    application_no    TEXT PRIMARY KEY,             -- 申请号（幂等键，业务唯一）
+    request_hash      TEXT NOT NULL,                 -- 规范化签发资料的 SHA-256 指纹
+    request           JSONB NOT NULL,                -- 完整签发资料（普通证书字段）
+    status            TEXT NOT NULL DEFAULT 'PENDING'
+                        CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED')),
+    submitter         TEXT NOT NULL,                 -- 录入人身份标识（本地凭据配置名）
+    submitter_key_hash TEXT NOT NULL,                -- 录入凭据 SHA-256：复核人不得与录入人同一凭据
+    submitted_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reviewer          TEXT,                          -- 复核人身份标识（定稿时写入，只写一次）
+    decision_reason   TEXT,                          -- 驳回原因（REJECTED 非空）
+    reviewed_at       TIMESTAMPTZ,                   -- 复核定稿时刻
+    cert_no           TEXT REFERENCES certificates(cert_no), -- 批准后绑定的真正签发证书
+    result            JSONB                          -- 批准时的签发结果快照（同直接签发同构）
+);
+
+-- 定稿字段的完整性：
+-- * APPROVED 必须已绑定复核人、定稿时刻、证书与签发结果，且不带驳回原因；
+-- * REJECTED 必须已绑定复核人、定稿时刻与非空驳回原因，且不产生证书；
+-- * PENDING 必须尚无任何复核结论。
+ALTER TABLE certificate_review_requests ADD CONSTRAINT cert_review_decision_metadata
+    CHECK (
+        (status = 'PENDING'
+             AND reviewer IS NULL AND reviewed_at IS NULL
+             AND decision_reason IS NULL AND cert_no IS NULL AND result IS NULL)
+        OR (status = 'APPROVED'
+             AND reviewer IS NOT NULL AND reviewed_at IS NOT NULL
+             AND decision_reason IS NULL
+             AND cert_no IS NOT NULL AND result IS NOT NULL)
+        OR (status = 'REJECTED'
+             AND reviewer IS NOT NULL AND reviewed_at IS NOT NULL
+             AND decision_reason IS NOT NULL
+             AND cert_no IS NULL AND result IS NULL)
+    );
+
+-- ----------------------------------------------------------------------------
 -- 触发器 1：证书签发内容不可改写
 -- 仅允许 status / revoked_reason / revoked_at 在撤销事务中变化；
 -- 其余业务字段（编号、设备、时间、结论、引用关系等）一律拒绝 UPDATE。
@@ -332,6 +376,35 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_cert_suspensions_lift_only
     BEFORE UPDATE OR DELETE ON cert_suspensions
     FOR EACH ROW EXECUTE FUNCTION cert_suspensions_lift_only();
+
+-- 复核申请仅允许“PENDING -> APPROVED/REJECTED”这一次性定稿 UPDATE：
+-- 申请内容（编号/签发资料/录入人/提交时刻）不可改，已驳回不得再批准、
+-- 已批准不得改判；DELETE 禁止。
+CREATE OR REPLACE FUNCTION cert_review_decide_once() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'certificate_review_requests is append-only: %', OLD.application_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.status <> 'PENDING' OR NEW.status NOT IN ('APPROVED', 'REJECTED')
+       OR NEW.application_no IS DISTINCT FROM OLD.application_no
+       OR NEW.request_hash   IS DISTINCT FROM OLD.request_hash
+       OR NEW.request        IS DISTINCT FROM OLD.request
+       OR NEW.submitter      IS DISTINCT FROM OLD.submitter
+       OR NEW.submitter_key_hash IS DISTINCT FROM OLD.submitter_key_hash
+       OR NEW.submitted_at   IS DISTINCT FROM OLD.submitted_at
+    THEN
+        RAISE EXCEPTION 'review request % can only be decided once (% -> %)',
+            OLD.application_no, OLD.status, NEW.status
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_cert_review_decide_once
+    BEFORE UPDATE OR DELETE ON certificate_review_requests
+    FOR EACH ROW EXECUTE FUNCTION cert_review_decide_once();
 
 -- ----------------------------------------------------------------------------
 -- 查询视图：统一将枚举以文本形式暴露给应用层

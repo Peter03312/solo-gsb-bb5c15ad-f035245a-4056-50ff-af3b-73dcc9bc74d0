@@ -18,6 +18,11 @@
 证书为追溯依据（单张与交接批次、批内引用均强制校验，命中整批不落库）；
 复核后凭管理密钥解除停用；可查询当前停用状态及历次停用/解除的时间与原因。
 停用不改写证书内容、撤销状态与已冻结的交付快照。
+需双人复核的普通校准证书可走**复核签发**：录入人凭本地配置的录入凭据提交
+申请号与完整签发资料（申请仅保存待审内容，不占用证书编号或设备有效期），
+另一身份的复核人凭独立凭据附原因**驳回**，或**批准**并在同一事务中按批准
+当时的标准证书状态、临时停用与现有签发规则真正签发，将结论、复核人与证书
+绑定；驳回后不能再批准，并发复核只允许一份定稿，同申请同操作重试返回原结果。
 面向监管与内审，还可按设备**审计过去半开区间内的校准覆盖**：按时间顺序还原
 完整、无重叠的合规与空窗片段，合规片段列出当时可用的合格普通证书编号。
 
@@ -39,7 +44,7 @@
 │   ├── db.py            # 连接池
 │   ├── config.py        # 环境变量配置
 │   └── errors.py        # 统一业务错误
-├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、批次/更正/交付归档/签收/停用表）
+├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、批次/更正/交付归档/签收/停用/复核申请表）
 ├── scripts/             # 冒烟测试脚本（可直接对运行中的服务执行）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -95,6 +100,8 @@ docker compose down -v       # 停止并删除数据卷（下次启动重新初�
 | `POSTGRES_PORT` | `127.0.0.1:5432` | 数据库在宿主机的绑定地址:端口 |
 | `DB_HOST` / `DB_PORT` | `db` / `5432` | API 容器内连接数据库用（compose 已固定） |
 | `DELIVERY_MANAGEMENT_KEY` | `caltrace-delivery-admin` | 管理密钥：创建签收邀请、查询定稿记录，以及标准证书临时停用的登记/解除/查询均经 `X-Management-Key` 头校验；默认值仅供本机开发，生产必须覆盖为随机长密钥 |
+| `CERTIFICATE_ENTRY_KEYS` | `entry-1=caltrace-entry-key` | 普通证书双人复核的**录入人凭据表**：逗号分隔，每项 `身份名=凭据`；提交申请经 `X-Entry-Key` 头校验。仅本地配置，默认值仅供本机开发 |
+| `CERTIFICATE_REVIEWER_KEYS` | `reviewer-1=caltrace-review-key-1,reviewer-2=caltrace-review-key-2` | 普通证书双人复核的**复核人凭据表**：格式同上；驳回/批准经 `X-Reviewer-Key` 头校验。复核凭据必须与该申请的录入凭据不同（同凭据复核 `403`）；默认值仅供本机开发 |
 
 ### 不用 Compose、直连已有 PostgreSQL
 
@@ -249,6 +256,50 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
       返回归档号、收件人、结论、拒收原因与签收时刻；密钥错误 `401`，
       归档包不存在 `404 archive_not_found`，归档包存在但尚未定稿
       `404 receipt_not_found`。
+15. **普通证书双人复核签发（录入申请 + 另一身份复核定稿）**：
+    - **凭据模型（本轮新增）**：在管理密钥之外新增两张**本地身份凭据表**
+      （环境变量 `CERTIFICATE_ENTRY_KEYS` / `CERTIFICATE_REVIEWER_KEYS`，
+      逗号分隔的 `身份名=凭据`）：录入人在 `X-Entry-Key` 头提交凭据，
+      复核人在 `X-Reviewer-Key` 头提交凭据。凭据仅保存在本地配置、不入库，
+      库内仅保存其 SHA-256（用于“双人不同凭据”校验），响应只回显身份名。
+      录入凭据与复核凭据分属两张表、互不通用（用错角色的凭据按无效处理
+      `401 invalid_identity_key`）；复核人凭据的指纹不得与该申请录入凭据
+      相同，否则 `403 reviewer_must_differ`。
+    - **提交申请**：录入人携带申请号（`application_no`）与完整普通证书签发
+      资料提交。申请**仅保存待审内容**：不预占证书编号（`cert_duplicate`
+      留待批准时判定）、不预占设备有效期（`validity_overlap` 留待批准时
+      判定），因此引用尚不存在的父证书、当下区间重叠等都允许先提交。
+      申请号为幂等键：同号同内容重试返回原申请（HTTP 200，状态随原申请），
+      同号异内容 `409 review_request_conflict`；并发同号由主键兜底。
+    - **驳回**：复核人 `decision=REJECT` 必须附非空白原因
+      （`422 review_reason_required`）；申请一次性推进为 REJECTED，记录
+      驳回结论、复核人、原因与时刻，**不产生证书**。**驳回后不能再批准**
+      （任何再定稿均 `409 review_already_decided`，唯一例外是同复核人同
+      结论同原因的重放返回首次结果）。
+    - **批准 = 同事务真正签发**：`decision=APPROVE` 不得携带原因
+      （`422 review_approve_reason_not_allowed`）。批准事务先锁定申请行，
+      再在**同一事务内**按**批准当时**的标准证书状态、临时停用记录与现有
+      全部签发规则执行与直接签发完全相同的校验和落库，成功后把申请推进为
+      APPROVED，并将结论、复核人、定稿时刻与真正签发的证书编号及签发结果
+      （证书+追溯链快照）绑定。任一步签发校验失败（`invalid_reference` /
+      `reference_not_active` / `reference_suspended` /
+      `reference_not_qualified` / `reference_out_of_validity` /
+      `validity_overlap` / `cert_duplicate` /
+      `validity_overlap_concurrent` 等，错误码与直接签发一致）整事务回滚：
+      **申请仍为 PENDING、不产生证书**，可在状态变化后由复核人再次批准。
+    - **定稿与重试**：每份申请至多一份定稿（申请行 `FOR UPDATE` 串行化，
+      触发器强制只允许 `PENDING → APPROVED/REJECTED` 一次性推进，申请内容
+      与定稿记录只增不改）。同一复核人同一操作（同结论、同驳回原因）重试
+      返回首次结果（HTTP 200，即使已过任意时长）；不同操作、不同复核人再
+      定稿一律 `409 review_already_decided`。
+    - **查询**：录入人或复核人凭据均可
+      `GET /api/v1/certificate-review-requests/{application_no}` 按申请号
+      查询状态与结果：PENDING 仅待审内容；APPROVED 含签发证书与追溯链
+      （首次签发结果快照，事后撤销不改写）；REJECTED 含驳回原因与复核人。
+      凭据缺失/错误 `401`，申请不存在 `404 review_request_not_found`。
+    - **不影响既有通道**：直接签发（`POST /api/v1/certificates`）、批次
+      签发与全部证书查询/撤销契约保持不变；批准签发的证书与直接签发的
+      证书在证书表中完全同形，可正常查询、撤销与级联失效。
 
 证书状态：`ACTIVE` 生效中 / `REVOKED` 被主动撤销 / `INVALID` 因上游撤销级联失效。
 
@@ -312,7 +363,123 @@ curl -sS -X POST http://localhost:8080/api/v1/certificates \
   }'
 ```
 
-### 3. 查询追溯引用链
+### 3. 提交普通证书签发复核申请（录入人，X-Entry-Key）
+
+需双人复核的普通校准证书，由录入人先提交**申请号 + 完整签发资料**。申请仅
+保存待审内容：此时**不占用证书编号、不占用设备有效期**（编号占用、区间重叠、
+父证书状态等全部留到批准当时判定），引用尚不存在的父证书也允许先提交。
+录入凭据通过 `X-Entry-Key` 请求头提交（身份名仅回显在 `submitter` 中）：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/certificate-review-requests \
+  -H 'Content-Type: application/json' \
+  -H 'X-Entry-Key: caltrace-entry-key' \
+  -d '{
+    "application_no": "RVW-2026-10-05-001",
+    "cert_no": "CAL-RV-001",
+    "device_id": "DEV-RV-C",
+    "device_name": "待复核万用表",
+    "valid_from": "2026-03-01T00:00:00+08:00",
+    "valid_to":   "2027-03-01T00:00:00+08:00",
+    "calibrated_at": "2026-03-05T10:00:00+08:00",
+    "conclusion": "PASS",
+    "parent_cert_no": "REF-MASTER-001",
+    "operator": "李工"
+  }'
+```
+
+首次提交响应 `201`（此时 `review` / `certificate` / `chain` 均为 `null`）：
+
+```json
+{
+  "application_no": "RVW-2026-10-05-001",
+  "status": "PENDING",
+  "request": {"cert_no": "CAL-RV-001", "conclusion": "PASS", "parent_cert_no": "REF-MASTER-001", "...": "完整签发资料"},
+  "submitter": "entry-1",
+  "submitted_at": "2026-10-05T01:10:00.123456+00:00",
+  "review": null,
+  "certificate": null,
+  "chain": null
+}
+```
+
+约定与拒绝场景：
+
+- **申请号幂等**：同号同内容重试返回原申请（`200`，状态随原申请）；
+  同号异内容 `409 review_request_conflict`；
+- 录入凭据缺失/错误（含误用复核凭据）→ `401 invalid_identity_key`；
+- 签发资料本身的结构校验（时间窗口、字段长度等）与直接签发一致，
+  结构不合法 `422`；但父证书存在性、生效/合格/有效期、停用、区间重叠、
+  编号占用等**业务校验不在提交时执行**。
+
+### 4. 复核人驳回 / 批准（X-Reviewer-Key，批准同事务真正签发）
+
+复核人凭**独立凭据**在 `X-Reviewer-Key` 头中提交结论。**驳回**须附非空原因：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/certificate-review-requests/RVW-2026-10-05-001/decision \
+  -H 'Content-Type: application/json' \
+  -H 'X-Reviewer-Key: caltrace-review-key-1' \
+  -d '{"decision": "REJECT", "reason": "校准记录缺少环境温度项，退回补正"}'
+```
+
+**批准**（不得携带原因）——服务在同一事务内按**批准当时**的标准证书状态、
+临时停用记录与现有全部签发规则真正签发，并把结论、复核人与证书绑定：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/certificate-review-requests/RVW-2026-10-05-001/decision \
+  -H 'Content-Type: application/json' \
+  -H 'X-Reviewer-Key: caltrace-review-key-1' \
+  -d '{"decision": "APPROVE"}' | python3 -m json.tool
+```
+
+批准成功响应 `201`，与申请视图同构——`status=APPROVED`、`review` 记录
+批准结论/复核人/时刻，`certificate` 与 `chain` 即真正签发结果（与第 2 节
+直接签发响应同构）。随后 `GET /api/v1/certificates/CAL-RV-001` 与追溯链
+查询均可正常访问，与直接签发的证书没有任何区别。
+
+关键约定：
+
+- **双人不同凭据**：复核凭据的指纹不得与该申请录入凭据相同，否则
+  `403 reviewer_must_differ`；复核凭据缺失/错误 `401 invalid_identity_key`；
+  申请不存在 `404 review_request_not_found`；
+- **驳回**：`REJECT` 原因空白 `422 review_reason_required`；`APPROVE`
+  携带原因 `422 review_approve_reason_not_allowed`；
+- **批准校验失败返回具体原因，申请仍待审、不产生证书**：错误码与直接签发
+  完全一致，例如父证书在等待期间被撤销 → `422 reference_not_active`、
+  被临时停用 → `422 reference_suspended`、校准时刻超出有效期 →
+  `422 reference_out_of_validity`、编号已被直接签发占用 → `409 cert_duplicate`、
+  同设备区间重叠 → `422 validity_overlap`（并发兜底 `409 validity_overlap_concurrent`）。
+  状态变化后（如停用解除）复核人可再次批准，无需重新提交申请；
+- **驳回后不能再批准**：每份申请只允许一份定稿。同一复核人同一操作
+  （同结论、同驳回原因）重试原样返回首次结果（`200`）；驳回后再批准、
+  批准后改判、其他复核人再定稿一律 `409 review_already_decided`
+  （`details` 给出首次定稿的复核人与结论）；
+- **并发复核只允许一份定稿**：申请行 `FOR UPDATE` 串行化，多个并发
+  APPROVE/REJECT 中恰一份成功，其余按“同操作重放/异操作冲突”处理；
+  批准事务与停用/撤销在引用链上的等待环由死锁检测终止并重试，耗尽返回
+  `409 review_busy`（申请仍为待审，可重试）。
+
+### 5. 按申请号查询复核状态与结果
+
+录入人或复核人凭据均可查询（任一角色的有效凭据）：
+
+```bash
+curl -sS http://localhost:8080/api/v1/certificate-review-requests/RVW-2026-10-05-001 \
+  -H 'X-Entry-Key: caltrace-entry-key' | python3 -m json.tool
+```
+
+- `PENDING`：完整待审签发资料 + 录入人/提交时刻，`review`、`certificate`、
+  `chain` 为 `null`；
+- `APPROVED`：追加 `review`（批准/复核人/时刻）与 `certificate`、`chain`
+  ——后者是批准当时的**首次签发结果快照**，证书事后被撤销也不改写；
+- `REJECTED`：`review` 中给出驳回结论、复核人、非空原因与定稿时刻，
+  `certificate` / `chain` 为 `null`（不产生证书）。
+
+凭据缺失/错误 `401 invalid_identity_key`；申请不存在
+`404 review_request_not_found`。
+
+### 6. 查询追溯引用链
 
 ```bash
 curl -sS http://localhost:8080/api/v1/certificates/CAL-CUS-001/chain | python3 -m json.tool
@@ -320,13 +487,13 @@ curl -sS http://localhost:8080/api/v1/certificates/CAL-CUS-001/chain | python3 -
 
 返回从基准到目标证书的有序节点链（`nodes[0]` 即追溯起点）。
 
-### 4. 查询某证书的全部下游（撤销前影响面预览）
+### 7. 查询某证书的全部下游（撤销前影响面预览）
 
 ```bash
 curl -sS http://localhost:8080/api/v1/certificates/REF-MASTER-001/downstream
 ```
 
-### 5. 撤销证书（级联失效下游，返回受影响证书与引用链）
+### 8. 撤销证书（级联失效下游，返回受影响证书与引用链）
 
 ```bash
 curl -sS -X POST http://localhost:8080/api/v1/certificates/REF-MASTER-001/revoke \
@@ -348,7 +515,7 @@ curl -sS -X POST http://localhost:8080/api/v1/certificates/REF-MASTER-001/revoke
 }
 ```
 
-### 6. 查询证书 / 列表 / 设备历史 / 撤销批次
+### 9. 查询证书 / 列表 / 设备历史 / 撤销批次
 
 ```bash
 # 单张证书（无论 ACTIVE / REVOKED / INVALID，历史内容始终可查）
@@ -365,7 +532,7 @@ curl -sS http://localhost:8080/api/v1/revocations
 curl -sS http://localhost:8080/api/v1/revocations/1
 ```
 
-### 7. 批量签发交接批次（整批原子、批次键幂等）
+### 10. 批量签发交接批次（整批原子、批次键幂等）
 
 离线采集的一组校准记录作为一个交接批次一次签发。每项通过 `kind` 区分基准
 （`REFERENCE`）或普通（`CALIBRATION`）证书，字段与单张签发一致；普通证书的
@@ -417,7 +584,7 @@ curl -sS -X POST http://localhost:8080/api/v1/certificate-batches \
   批内特有问题使用 `batch_cert_duplicate`（批内编号重复）与
   `reference_cycle`（批内引用成环）。
 
-### 8. 查询签发批次（首次签发结果快照）
+### 11. 查询签发批次（首次签发结果快照）
 
 ```bash
 curl -sS http://localhost:8080/api/v1/certificate-batches/HANDOFF-2026-10-03-001 | python3 -m json.tool
@@ -425,7 +592,7 @@ curl -sS http://localhost:8080/api/v1/certificate-batches/HANDOFF-2026-10-03-001
 
 返回与签发响应同构的快照，不受事后撤销影响；批次不存在返回 `404 batch_not_found`。
 
-### 9. 登记更正声明（纠正展示字段录入错误）
+### 12. 登记更正声明（纠正展示字段录入错误）
 
 证书签发后业务字段不可改写；若 `device_name` / `operator` / `remark` 录入有误，
 通过更正声明纠错（仅这三个展示字段可更正）：
@@ -474,7 +641,7 @@ curl -sS -X POST http://localhost:8080/api/v1/correction-declarations \
 全部声明按登记顺序（`seq`）升序排列；`display` 为按序合并后的当前展示——同一字段
 后登记的声明覆盖先登记的。
 
-### 10. 查询证书的更正视图（声明历史 + 合并展示）
+### 13. 查询证书的更正视图（声明历史 + 合并展示）
 
 ```bash
 curl -sS http://localhost:8080/api/v1/certificates/CAL-WS-001/corrections | python3 -m json.tool
@@ -483,7 +650,7 @@ curl -sS http://localhost:8080/api/v1/certificates/CAL-WS-001/corrections | pyth
 返回 `cert_no`、`certificate`（原证书）、`declarations`（声明历史，按 `seq` 升序）与
 `display`（合并后的当前展示）；证书不存在返回 `404 cert_not_found`。
 
-### 11. 按声明编号查询
+### 14. 按声明编号查询
 
 ```bash
 curl -sS http://localhost:8080/api/v1/correction-declarations/CORR-2026-0001 | python3 -m json.tool
@@ -495,7 +662,7 @@ curl -sS http://localhost:8080/api/v1/correction-declarations/CORR-2026-0001 | p
 > 注意：`GET /api/v1/certificates/{cert_no}`、追溯链与批次快照始终返回签发时的
 > 原始字段值；合并后的展示值只通过上述更正相关接口与交付归档包快照获取。
 
-### 12. 创建客户交付归档包（冻结可交付追溯凭据）
+### 15. 创建客户交付归档包（冻结可交付追溯凭据）
 
 向客户交付一组校准证书时，以归档包编号和**非空、有序、编号互不重复**的证书
 编号列表冻结当时可交付的凭据。服务校验每张目标证书均为 `CALIBRATION`，且
@@ -567,7 +734,7 @@ curl -sS -X POST http://localhost:8080/api/v1/delivery-archives \
   撤销/更正先提交则本包按新状态判定（成功则整体新状态快照，否则整包拒绝），
   本包先提交则整体冻结旧状态；并发同编号重试由主键保证仅一个快照。
 
-### 13. 查询交付归档包（创建时刻快照）
+### 16. 查询交付归档包（创建时刻快照）
 
 ```bash
 curl -sS http://localhost:8080/api/v1/delivery-archives/DELIVERY-2026-10-03-001 | python3 -m json.tool
@@ -576,7 +743,7 @@ curl -sS http://localhost:8080/api/v1/delivery-archives/DELIVERY-2026-10-03-001 
 返回与创建响应同构的快照，不受事后更正/撤销影响；归档包编号未知返回
 `404 archive_not_found`。
 
-### 14. 按撤销批次追查已交付凭据影响面（分页）
+### 17. 按撤销批次追查已交付凭据影响面（分页）
 
 证书撤销后，客服凭撤销响应中的 `batch_id` 追查该批撤销波及了哪些已交付的
 归档凭据。以第 5 节撤销 `REF-MASTER-001` 得到的 `batch_id=1` 为例：
@@ -637,7 +804,7 @@ curl -sS 'http://localhost:8080/api/v1/revocations/1/archive-impact?limit=50&off
 - 批次不存在返回 `404 revocation_not_found`；无受影响归档返回
   `200` 空页（`total=0`、`items=[]`）。
 
-### 15. 审计设备校准覆盖（过去半开区间的合规/空窗片段）
+### 18. 审计设备校准覆盖（过去半开区间的合规/空窗片段）
 
 面向监管与内审：按设备与带时区的起止时刻，审计过去半开区间 `[from, to)`
 内的校准覆盖。按时间顺序返回完整、无重叠的合规（`COMPLIANT`）与空窗
@@ -684,7 +851,7 @@ curl -sS 'http://localhost:8080/api/v1/devices/DEV-WS-A/coverage-audit?from=2026
 - 起止必须携带时区、起点必须早于终点、终点不得晚于查询时刻，否则
   `422 invalid_audit_window`；响应中的时间统一为 UTC（与输入为同一时刻）。
 
-### 16. 创建交付签收邀请（交付方，管理密钥）
+### 19. 创建交付签收邀请（交付方，管理密钥）
 
 交付方按已创建的归档包编号、收件人和未来截止时间创建签收邀请。管理密钥通过
 `X-Management-Key` 请求头提交（对应服务端环境变量 `DELIVERY_MANAGEMENT_KEY`）：
@@ -723,7 +890,7 @@ curl -sS -X POST http://localhost:8080/api/v1/delivery-invitations \
 
 同一归档包可创建多份邀请（例如首次邀请过期后重新邀约）；邀请只增不改。
 
-### 17. 收件人提交签收结论（ACCEPT / REJECT）
+### 20. 收件人提交签收结论（ACCEPT / REJECT）
 
 收件人在截止前用邀请编号与一次性密钥提交结论，**不需要**管理密钥。
 接收（ACCEPT）：
@@ -796,7 +963,7 @@ ACCEPT 的撤销/失效复核——若包内目标或其冻结追溯链中已有
 多目标包只点名受影响者）。此时 `REJECT`（带原因）仍可正常提交。签收与撤销
 并发时按实际提交顺序判定，定稿后的撤销不改写签收记录与归档快照。
 
-### 18. 凭管理密钥查询定稿记录
+### 21. 凭管理密钥查询定稿记录
 
 ```bash
 curl -sS http://localhost:8080/api/v1/delivery-archives/DELIVERY-2026-10-03-001/receipt \
@@ -809,7 +976,7 @@ curl -sS http://localhost:8080/api/v1/delivery-archives/DELIVERY-2026-10-03-001/
 密钥的 `GET /api/v1/delivery-archives/{archive_no}` 获取（既有语义不变）；
 定稿记录仅交付方凭管理密钥查询。
 
-### 19. 登记标准证书临时停用（待复核，管理密钥）
+### 22. 登记标准证书临时停用（待复核，管理密钥）
 
 计量人员发现生效中的标准证书数据存疑、有待复核时，凭管理密钥登记临时停用。
 管理密钥通过 `X-Management-Key` 请求头提交（与签收功能共用环境变量
@@ -852,7 +1019,7 @@ curl -sS -X POST http://localhost:8080/api/v1/certificates/REF-MASTER-001/suspen
 - 证书不是生效中（已撤销/失效）→ `409 cert_not_active`；
 - 已存在生效中的停用记录（重复停用）→ `409 suspension_conflict`。
 
-### 20. 复核后解除临时停用（管理密钥）
+### 23. 复核后解除临时停用（管理密钥）
 
 复核结束、证书恢复可用时，凭管理密钥与非空原因解除停用。解除成功后该证书
 及其下游链可立即重新作为新签发证书的追溯依据：
@@ -895,7 +1062,7 @@ curl -sS -X POST http://localhost:8080/api/v1/certificates/REF-MASTER-001/suspen
 拒绝、**整批不落库**（无批次快照、批内证书均不存在）。停用解除后被拒的
 单张/批次请求即可正常签发；同键同内容批次重放仍返回**首次签发快照**。
 
-### 21. 查询停用状态与历次停用/解除（管理密钥）
+### 24. 查询停用状态与历次停用/解除（管理密钥）
 
 ```bash
 curl -sS http://localhost:8080/api/v1/certificates/REF-MASTER-001/suspensions \
@@ -922,6 +1089,14 @@ curl -sS http://localhost:8080/api/v1/certificates/REF-MASTER-001/suspensions \
 | --- | --- | --- |
 | 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` / `declaration_not_found` / `archive_not_found` / `invitation_not_found` / `receipt_not_found` | 目标不存在（`receipt_not_found`：归档包存在但尚未定稿） |
 | 401 | `invalid_management_key` | 创建签收邀请、查询定稿记录，或登记/解除/查询标准证书停用时 `X-Management-Key` 缺失/错误 |
+| 401 | `invalid_identity_key` | 提交复核申请时 `X-Entry-Key`、驳回/批准/查询复核时 `X-Reviewer-Key`（或录入凭据）缺失/无效（两角色凭据不通用） |
+| 403 | `reviewer_must_differ` | 复核人与录入人使用了同一把身份凭据（普通证书签发须双人复核） |
+| 404 | `review_request_not_found` | 按申请号定稿或查询时申请不存在 |
+| 409 | `review_request_conflict` | 同一申请号提交了签发资料不同的复核申请 |
+| 409 | `review_already_decided` | 申请已有定稿：驳回后再批准、批准后改判、或其他复核人再定稿（同复核人同操作重试返回首次结果） |
+| 422 | `review_reason_required` | 驳回（REJECT）未填写或仅空白的驳回原因 |
+| 422 | `review_approve_reason_not_allowed` | 批准（APPROVE）请求携带了驳回原因 |
+| 409 | `review_busy` | 批准与并发停用/撤销竞争且死锁重试耗尽（申请仍为待审，可重试） |
 | 401 | `invalid_receipt_key` | 提交签收时一次性密钥错误 |
 | 409 | `suspension_conflict` | 证书已存在生效中的临时停用记录，重复停用被拒 |
 | 409 | `suspension_not_active` | 证书没有生效中的临时停用记录（重复/并发解除） |
@@ -976,6 +1151,7 @@ python3 scripts/impact_checks.py      # 撤销影响面：命中判定/序位/�
 python3 scripts/receipt_checks.py     # 交付签收：邀请一次性密钥/截止/定稿幂等冲突/撤销拦截/并发次序
 python3 scripts/coverage_checks.py    # 覆盖审计：计入窗口/撤销与级联截断/重签还原/空窗/参数错误
 python3 scripts/suspension_checks.py  # 标准证书临时停用：登记/解除/查询/受阻链单张与批次拦截/不改写/提交次序并发
+python3 scripts/review_checks.py      # 普通证书双人复核：凭据/待审不占用/驳回不可再批准/批准按当时规则真正签发/失败仍待审/幂等与并发定稿/契约不变
 ```
 
 覆盖：基准登记、多级签发、无效引用、越界校准时刻、区间重叠（含首尾相接）、
@@ -1031,3 +1207,18 @@ ACCEPT 且不被随后撤销改写，先撤销则 ACCEPT 422 且不留定稿）�
 影响，撤销与停用可并存且互不改写；停用/解除×签发的 32 路提交次序并发
 （先停用则后到签发必拒、先签发则落库；先解除则放行、签发先到则 422），
 以及既有签发/撤销/批次/归档/签收接口契约与根索引端点清单不变。
+普通证书双人复核签发的录入/复核凭据校验（缺失/错误/角色串用 401、
+同凭据复核 403 且申请仍待审）、申请提交（201 PENDING、待审不占证书编号
+与设备有效期、父证书暂不存在也可提交）、申请号幂等（同内容重放 200、
+异内容 409、并发同号同内容 1 份 201 其余 200）、驳回（空白原因 422、
+REJECTED 绑定结论/复核人/原因/时刻且不产生证书、驳回后再批准与异原因
+再驳回 409、同复核人同原因重放 200、其他复核人再提交 409）、批准
+（同事务真正签发并返回与直接签发同构的证书与追溯链、事后证书可查可撤销、
+批准后不可改判、同操作重放返回首次结果且签发时刻不变）、批准校验失败
+（父不存在/已撤销/临时停用/编号占用/区间重叠/校准时刻超有效期分别返回
+与直接签发一致的具体错误码，申请恒仍 PENDING 且无证书；停用解除后原申请
+可再次批准成功）、按申请号查询（无/错凭据 401、未知申请 404、待审/批准/
+驳回三视图、批准结果为首次签发快照且事后撤销不改写）、12 路并发混合
+定稿（恰一份 201 其余 409、最终状态与胜方一致、批准胜方只签一张证书/
+驳回胜方不产生证书）、8 路同复核人同操作并发（1×201 其余 200 且响应
+全等），以及既有直接签发/查询/撤销/追溯链契约与根索引端点清单不变。

@@ -89,6 +89,66 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_cert_suspensions_one_active
     ON cert_suspensions(cert_no) WHERE (lifted_at IS NULL);
 """,
     """
+CREATE TABLE IF NOT EXISTS certificate_review_requests (
+    application_no      TEXT PRIMARY KEY,
+    request_hash        TEXT NOT NULL,
+    request             JSONB NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'PENDING'
+                            CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED')),
+    submitter           TEXT NOT NULL,
+    submitter_key_hash  TEXT NOT NULL,
+    submitted_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reviewer            TEXT,
+    decision_reason     TEXT,
+    reviewed_at         TIMESTAMPTZ,
+    cert_no             TEXT REFERENCES certificates(cert_no),
+    result              JSONB
+);
+ALTER TABLE certificate_review_requests DROP CONSTRAINT IF EXISTS cert_review_decision_metadata;
+ALTER TABLE certificate_review_requests ADD CONSTRAINT cert_review_decision_metadata
+    CHECK (
+        (status = 'PENDING'
+             AND reviewer IS NULL AND reviewed_at IS NULL
+             AND decision_reason IS NULL AND cert_no IS NULL AND result IS NULL)
+        OR (status = 'APPROVED'
+             AND reviewer IS NOT NULL AND reviewed_at IS NOT NULL
+             AND decision_reason IS NULL
+             AND cert_no IS NOT NULL AND result IS NOT NULL)
+        OR (status = 'REJECTED'
+             AND reviewer IS NOT NULL AND reviewed_at IS NOT NULL
+             AND decision_reason IS NOT NULL
+             AND cert_no IS NULL AND result IS NULL)
+    );
+""",
+    """
+CREATE OR REPLACE FUNCTION cert_review_decide_once() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'certificate_review_requests is append-only: %', OLD.application_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.status <> 'PENDING' OR NEW.status NOT IN ('APPROVED', 'REJECTED')
+       OR NEW.application_no IS DISTINCT FROM OLD.application_no
+       OR NEW.request_hash   IS DISTINCT FROM OLD.request_hash
+       OR NEW.request        IS DISTINCT FROM OLD.request
+       OR NEW.submitter      IS DISTINCT FROM OLD.submitter
+       OR NEW.submitter_key_hash IS DISTINCT FROM OLD.submitter_key_hash
+       OR NEW.submitted_at   IS DISTINCT FROM OLD.submitted_at
+    THEN
+        RAISE EXCEPTION 'review request % can only be decided once (% -> %)',
+            OLD.application_no, OLD.status, NEW.status
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_cert_review_decide_once
+    BEFORE UPDATE OR DELETE ON certificate_review_requests
+    FOR EACH ROW EXECUTE FUNCTION cert_review_decide_once();
+""",
+    """
 CREATE OR REPLACE FUNCTION cert_suspensions_lift_only() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'DELETE' THEN

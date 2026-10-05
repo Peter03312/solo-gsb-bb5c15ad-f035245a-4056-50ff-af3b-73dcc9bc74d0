@@ -47,6 +47,39 @@ class CertificateIssueRequest(_IssueBase):
     parent_cert_no: str = Field(..., min_length=1, description="引用的标准设备证书编号")
 
 
+class CertificateReviewSubmitRequest(CertificateIssueRequest):
+    """录入人提交“待双人复核”的普通证书签发申请。
+
+    申请只保存待审内容与完整签发资料，不占用证书编号或设备有效期；
+    application_no 为幂等键：同号同内容重试返回原申请（200），
+    同号异内容返回 409 review_request_conflict。
+    录入人凭据经 X-Entry-Key 请求头校验（不在 body 中）。
+    """
+    application_no: str = Field(
+        ..., min_length=1, max_length=128,
+        description="申请号（幂等键，业务唯一）：同号同内容重试返回原申请",
+    )
+
+
+class CertificateReviewDecisionRequest(BaseModel):
+    """复核人对申请的定稿操作：APPROVE 批准 / REJECT 驳回。
+
+    REJECT 必须填写非空白原因；APPROVE 不得携带原因。批准与真正签发在同一
+    事务中按批准当时的标准证书状态、临时停用与现有签发规则完成；校验失败
+    时申请仍为 PENDING、不产生证书。驳回后不能再批准。同申请同操作（同
+    复核人同结论同原因）重试返回首次结果（200），其余再定稿一律 409。
+    复核人凭据经 X-Reviewer-Key 请求头校验，且不得与录入凭据相同。
+    申请号取自 URL 路径，不放在 body 中。
+    """
+    decision: Literal["APPROVE", "REJECT"] = Field(
+        ..., description="APPROVE=批准并在同事务真正签发；REJECT=附原因驳回"
+    )
+    reason: str | None = Field(
+        None, max_length=1024,
+        description="驳回原因：REJECT 必填且非空；APPROVE 不得填写",
+    )
+
+
 class RevokeRequest(BaseModel):
     reason: str = Field(..., min_length=1, max_length=1024, description="撤销原因")
     operator: str | None = Field(None, max_length=128)
@@ -210,6 +243,36 @@ class TraceChainOut(BaseModel):
 class IssueResponse(BaseModel):
     certificate: CertificateOut
     chain: TraceChainOut
+
+
+class CertificateReviewDecisionOut(BaseModel):
+    decision: Literal["APPROVE", "REJECT"]
+    reviewer: str = Field(..., description="复核人身份名（本地凭据配置名）")
+    reason: str | None = Field(None, description="驳回原因（仅 REJECT）")
+    reviewed_at: datetime
+
+
+class CertificateReviewApplicationOut(BaseModel):
+    """复核申请视图：待审签发资料、状态与定稿结果。
+
+    - PENDING：仅保存待审内容，不占用证书编号/设备有效期，review/certificate/chain 为空；
+    - APPROVED：certificate/chain 为批准当时真正签发的结果（与直接签发同构）；
+    - REJECTED：review.reason 给出驳回原因，不产生证书。
+    """
+    application_no: str
+    status: Literal["PENDING", "APPROVED", "REJECTED"]
+    request: dict = Field(..., description="完整签发资料（普通证书字段）")
+    submitter: str = Field(..., description="录入人身份名（本地凭据配置名）")
+    submitted_at: datetime
+    review: CertificateReviewDecisionOut | None = Field(
+        None, description="复核定稿信息（结论、复核人、原因与时刻）；待审时为 null"
+    )
+    certificate: CertificateOut | None = Field(
+        None, description="批准后真正签发的证书（与直接签发响应中的 certificate 同构）"
+    )
+    chain: TraceChainOut | None = Field(
+        None, description="批准后签发证书的完整追溯链（与直接签发响应中的 chain 同构）"
+    )
 
 
 class BatchIssueItemOut(BaseModel):

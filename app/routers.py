@@ -3,6 +3,9 @@
 约定：
 - POST   /api/v1/reference-certificates        登记基准设备合格证书（追溯起点）
 - POST   /api/v1/certificates                  签发普通校准证书
+- POST   /api/v1/certificate-review-requests   录入人提交普通证书签发复核申请（X-Entry-Key，申请号幂等）
+- POST   /api/v1/certificate-review-requests/{application_no}/decision  复核人驳回/批准（X-Reviewer-Key，批准同事务真正签发）
+- GET    /api/v1/certificate-review-requests/{application_no}  按申请号查询状态与结果（录入/复核凭据）
 - POST   /api/v1/certificate-batches           批量签发交接批次（整批原子、批次键幂等）
 - GET    /api/v1/certificate-batches/{batch_key}  查询签发批次（首次签发结果快照）
 - GET    /api/v1/certificates                  证书列表（可按设备/状态/类型过滤）
@@ -37,6 +40,8 @@ from . import repository as repo
 from .schemas import (
     BatchIssueRequest,
     CertificateIssueRequest,
+    CertificateReviewDecisionRequest,
+    CertificateReviewSubmitRequest,
     CertificateSuspensionRequest,
     CorrectionDeclarationRequest,
     DeliveryArchiveRequest,
@@ -65,6 +70,71 @@ def issue_reference(req: ReferenceIssueRequest, pool: ConnectionPool = Depends(p
 def issue_certificate(req: CertificateIssueRequest, pool: ConnectionPool = Depends(pool_dep)):
     with pool.connection() as conn:
         return repo.issue_certificate(conn, req)
+
+
+@router.post("/certificate-review-requests", status_code=201)
+def submit_certificate_review(
+    req: CertificateReviewSubmitRequest,
+    response: Response,
+    x_entry_key: str | None = Header(
+        default=None,
+        alias="X-Entry-Key",
+        description="录入人本地配置的身份凭据（CERTIFICATE_ENTRY_KEYS）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """录入人提交需双人复核的普通证书签发申请：仅保存待审内容与完整签发资料，
+    不占用证书编号或设备有效期。
+
+    申请号为幂等键：同号同内容重试返回原申请（200），同号异内容
+    409 review_request_conflict；录入凭据缺失/错误 401 invalid_identity_key。
+    """
+    with pool.connection() as conn:
+        body, created = repo.submit_certificate_review(conn, req, x_entry_key)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.post("/certificate-review-requests/{application_no}/decision", status_code=201)
+def decide_certificate_review(
+    application_no: str,
+    req: CertificateReviewDecisionRequest,
+    response: Response,
+    x_reviewer_key: str | None = Header(
+        default=None,
+        alias="X-Reviewer-Key",
+        description="复核人本地配置的身份凭据（CERTIFICATE_REVIEWER_KEYS），须与录入凭据不同",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """复核人驳回（附原因）或批准：批准与真正签发在同一事务内按批准当时的
+    标准证书状态、临时停用与现有签发规则完成，结论/复核人/证书绑定。
+
+    批准校验失败返回与直接签发一致的具体错误码，申请仍待审、不产生证书；
+    驳回后不能再批准。同复核人同操作重试返回首次结果（200），其余再定稿
+    409 review_already_decided；并发复核只允许一份定稿。
+    """
+    with pool.connection() as conn:
+        body, created = repo.decide_certificate_review(
+            conn, application_no, req, x_reviewer_key
+        )
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.get("/certificate-review-requests/{application_no}")
+def get_certificate_review(
+    application_no: str,
+    x_entry_key: str | None = Header(default=None, alias="X-Entry-Key"),
+    x_reviewer_key: str | None = Header(default=None, alias="X-Reviewer-Key"),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """按申请号查询状态与结果（录入人或复核人凭据均可）：PENDING 待审内容、
+    APPROVED 签发证书与追溯链（首次结果快照）、REJECTED 驳回原因与复核人。"""
+    with pool.connection() as conn:
+        return repo.get_certificate_review(conn, application_no, x_entry_key or x_reviewer_key)
 
 
 @router.post("/certificate-batches", status_code=201)
